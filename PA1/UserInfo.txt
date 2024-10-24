@@ -1,0 +1,3 @@
+admin:admin
+hello:world
+root:123456
