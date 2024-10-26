@@ -229,8 +229,9 @@ def authenticate(sock: socket.socket, user_list: UserList) -> bool:
 
 
 def handle_list(player: Player) -> None:
-    player.send(f"3001 {len(rooms)} {' '.join(
-        [str(len(room)) for room in rooms])}")
+    player.send(
+        f"3001 {len(rooms)} {' '.join([str(len(room)) for room in rooms])}"
+    )
 
 
 def handle_enter(player: Player, room_id: int) -> None:
