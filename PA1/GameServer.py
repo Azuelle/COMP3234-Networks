@@ -1,26 +1,33 @@
+from __future__ import annotations
 from pathlib import Path
 import logging as log
 import sys
 import socket
 import threading
 from enum import Enum, auto
-import typing
+from typing import cast
 import random
 
-Player = typing.Type("Player")
+
+def format_ip(addr: socket._RetAddress) -> str:
+    return f"{addr[0]}:{addr[1]}"
 
 
 class UserList:
-    def __init__(path: Path, self) -> None:
+    def __init__(self, path: Path | None = None) -> None:
+        self.users = dict[str, str]()
+        if Path is not None:
+            self.load(cast(Path, path))
+
+    def load(self, path: Path) -> None:
         try:
             with open(path) as file:
                 self.users = {line.strip().split(":")[0]: line.strip().split(":")[
                     1] for line in file.readlines()}
         except:
             log.error(f"Failed to open user info file at {path}")
-            exit(1)
 
-    def validate(username: str, password: str, self) -> Player | None:
+    def validate(self, username: str, password: str) -> bool:
         return self.users.get(username) == password
 
 
@@ -45,6 +52,25 @@ class GameRoom:
 
 
 class GuessGameRoom(GameRoom):
+    def __init__(self) -> None:
+        super().__init__()
+        self.MAX_PLAYERS = 2
+
+    def add_player(self, player: Player) -> None:
+        with self.lock:
+            if len(self.players) == self.MAX_PLAYERS:
+                player.send("3013 The room is full")
+                return
+
+            self.players.append(player)
+            with player.lock:
+                player.join(self)
+
+            if len(self.players) == self.MAX_PLAYERS:
+                self.start()
+            else:
+                player.send("3011 Wait")
+
     def get_guess(self, player: Player) -> None:
         log.info(f"Waiting for guess from {player}")
         while True:
@@ -52,19 +78,19 @@ class GuessGameRoom(GameRoom):
                 with player.lock:
                     msg = player.sock.recv(1024).decode("ascii").split()
                     if len(msg) == 2 and msg[0] == "/guess" and msg[1] in ["true", "false"]:
-                        player.guess = msg[1] == "true"
+                        self.guesses[player] = msg[1] == "true"
                         return
                 log.error(f"Received invalid message")
                 player.send(
-                    "4002 Unrecognized message".encode("ascii"))
+                    "4002 Unrecognized message")
             except UnicodeDecodeError as e:
                 log.error(f"Unicode decode error: {e}")
                 player.send(
-                    "4002 Unrecognized message".encode("ascii"))
+                    "4002 Unrecognized message")
 
     def start(self) -> None:
         try:
-            assert len(self.players) == 2
+            assert len(self.players) == self.MAX_PLAYERS
         except AssertionError:
             log.error("Invalid number of players")
             return
@@ -72,13 +98,14 @@ class GuessGameRoom(GameRoom):
         try:
             # Brodcast game start
             log.info("Starting game in room with players: ", self.players)
+            self.guesses: dict[Player, bool | None] = {
+                player: None for player in self.players}
 
             threads = []
             for player in self.players:
                 log.info(f"Notifying {player}")
                 with player.lock:
                     player.state = Player.State.INGAME
-                    player.guess = None
                     player.send(
                         "3012 Game started. Please guess true or false")
 
@@ -90,15 +117,14 @@ class GuessGameRoom(GameRoom):
                 t.join()
 
             # Game main logic
-            guesses = [player.guess for player in self.players]
-            if guesses[0] == guesses[1]:
+            if self.guesses[self.players[0]] == self.guesses[self.players[1]]:
                 # Tie
                 for player in self.players:
                     with player.lock:
                         player.send("3023 The result is a tie")
             else:
                 ans = random.choice([True, False])
-                winner_id = guesses.index(ans)
+                winner_id = self.guesses[self.players[1]] == ans
 
                 winner = self.players[winner_id]
                 with winner.lock:
@@ -152,7 +178,7 @@ class Player:
 
     def __init__(self, sock: socket.socket) -> None:
         self.state = Player.State.LOBBY
-        self.room = None
+        self.room: GameRoom | None = None
         self.sock = sock
         self.lock = threading.Lock()
         self.exitedException = self.ExitedException(
@@ -164,28 +190,88 @@ class Player:
         self.state = Player.State.WAITING
 
     def leave(self) -> None:
-        self.room = None
         self.state = Player.State.LOBBY
-        self.room.remove_player(self)
+        if self.room is not None:
+            self.room.remove_player(self)
+        self.room = None
 
     def exit(self) -> None:
         self.state = Player.State.DISCONNECTED
 
-    def send(self, msg: str) -> None:
+    def send(self, msg: str | bytes) -> None:
         try:
-            self.sock.send(msg.encode("ascii"))
+            if msg is str:
+                self.sock.send(msg.encode("ascii"))
+            elif msg is bytes:
+                self.sock.send(cast(bytes, msg))
         except socket.error as e:
             log.error(f"Socket error: {e}")
             self.state = Player.State.DISCONNECTED
             raise self.exitedException
 
 
-def format_ip(addr: tuple[str, int]) -> str:
-    return f"{addr[0]}:{addr[1]}"
+def authenticate(sock: socket.socket, user_list: UserList) -> bool:
+    log.info(f"Authenticating {format_ip(sock.getsockname())}")
+    authenticated = False
+    while not authenticated:
+        msg = sock.recv(1024).decode("ascii").split()
+        if len(msg) == 3 and msg[0] == "/login":
+            username, password = msg[1], msg[2]
+            if user_list.validate(username, password):
+                sock.send("1001 Authentication successful".encode("ascii"))
+                authenticated = True
+            else:
+                sock.send("1002 Authentication failed".encode("ascii"))
+        else:
+            sock.send("4002 Unrecognized message".encode("ascii"))
+
+    return authenticated
 
 
-def handle_client(sock: socket.socket) -> None:
-    pass
+def handle_list(player: Player) -> None:
+    player.send(f"3001 {len(rooms)} {' '.join(
+        [str(len(room)) for room in rooms])}")
+
+
+def handle_enter(player: Player, room_id: int) -> None:
+    rooms[room_id].add_player(player)
+
+
+def handle_unknown(player: Player) -> None:
+    player.send("4002 Unrecognized message")
+
+
+MSG_HANDLERS = {"/list": handle_list, "/enter": handle_enter}
+MSG_LENGTHS = {"/list": 1, "/enter": 2}
+
+
+def handle_client(sock: socket.socket, user_list: UserList) -> None:
+    try:
+        if not authenticate(sock, user_list):
+            log.error("Failed to authenticate user")
+            return
+    except socket.error as e:
+        log.error(f"Socket error: {e}")
+
+    player = Player(sock)
+    log.info(f"Player {player} successfully logged in")
+
+    # Receive messages
+    while True:
+        try:
+            msg = sock.recv(1024).decode("ascii").split()
+
+            if msg[0] == "/exit" and len(msg) == 1:
+                player.send("4001 Bye Bye")
+                break
+            elif msg[0] in MSG_HANDLERS and len(msg) == MSG_LENGTHS[msg[0]]:
+                MSG_HANDLERS[msg[0]](player, *msg[1:])
+            else:
+                handle_unknown(player)
+
+        except Player.ExitedException as e:
+            log.error(f"{e}")
+            break
 
 
 def main() -> None:
@@ -231,8 +317,10 @@ def main() -> None:
             conn, addr = server_socket.accept()
         except socket.error as e:
             log.error(f"Socket error when accepting client: {e}")
-            exit(1)
+            continue
+
         log.info(f"Client {format_ip(addr)} established connection")
+        threading.Thread(target=handle_client, args=(conn, user_list)).start()
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ def connect_server(addr: str, port: int) -> socket.socket:
     try:
         assert 0 <= port <= 65535
         sock = socket.socket()
-        socket.connect((addr, port))
+        sock.connect((addr, port))
     except AssertionError as e:
         log.error(f"Invalid port: {e}")
         exit(1)
