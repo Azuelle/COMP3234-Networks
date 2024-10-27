@@ -2,6 +2,8 @@
 
 ## Usage
 
+Using the `--debug` flag enables debug/info logs, otherwise only logs with level `WARNING` or above would be displayed.
+
 ### Server
 
 ```text

@@ -124,8 +124,11 @@ class GameRoom:
         self.clean.set()
 
     def cleanup(self) -> None:
-        while len(self.players) > 0:
-            pass
+        for p in self.players:
+            with p.lock:
+                p.state = Player.State.LOBBY
+                p.room = None
+
         self.reset()
 
 
@@ -143,12 +146,12 @@ class GuessGameRoom(GameRoom):
 
         with self._lock:
             self.clean.wait()
-            if len(self.players) == self.MAX_PLAYERS:
-                self.start(player)
-                return True
-            else:
+            if len(self.players) != self.MAX_PLAYERS:
                 player.send("3011 Wait")
                 return False
+
+        self.start(player)
+        return True
 
     def get_guess(self, player: Player) -> None:
         log.info(f"Waiting for guess from {player}")
@@ -199,26 +202,32 @@ class GuessGameRoom(GameRoom):
             self.get_guess(player)
 
             # Wait for all players to finish
-            for player in self.players:
-                self.got_guess[player].wait()
+            for p in self.players:
+                self.got_guess[p].wait()
 
             # Game main logic
-            if self.guesses[self.players[0]] == self.guesses[self.players[1]]:
-                # Tie
-                for player in self.players:
-                    player.send("3023 The result is a tie")
-            else:
-                ans = random.choice([True, False])
-                winner_id = self.guesses[self.players[1]] == ans
+            if self.abort.is_set():
+                return
 
-                winner = self.players[winner_id]
-                winner.send("3021 You won this game")
+            with self._lock:
+                if self.guesses[self.players[0]] == self.guesses[self.players[1]]:
+                    # Tie
+                    for p in self.players:
+                        p.send("3023 The result is a tie")
+                else:
+                    ans = random.choice([True, False])
+                    winner_id = self.guesses[self.players[1]] == ans
 
-                loser = self.players[not winner_id]
-                loser.send("3022 You lost this game")
+                    winner = self.players[winner_id]
+                    loser = self.players[not winner_id]
+
+                    winner.send("3021 You won this game")
+                    loser.send("3022 You lost this game")
+
+            for p in self.players:
+                p.leave()
 
             self.finish.set()
-            player.leave()
 
             threading.Thread(target=self.cleanup).start()
 
@@ -232,14 +241,26 @@ class GuessGameRoom(GameRoom):
 
         # Resolve other players
         for player in self.players:
-            if player.state != Player.State.INGAME:
-                continue
-
             try:
-                player.send("3021 You won this game")
-            except Player.ExitedException as e:
-                log.error(f"{e}")
-                self.remove_player(e.player)
+                if player.state == Player.State.LOBBY:
+                    continue
+
+                if player.state == Player.State.WAITING:
+                    player.send(
+                        "3012 Game started. Please guess true or false")
+                    with player.lock:
+                        player.state = Player.State.INGAME
+                    player.sock.recv(1024)
+
+                # INGAME
+                try:
+                    player.send("3021 You won this game")
+                except Player.ExitedException as ee:
+                    log.error(f"{ee}")
+                    self.remove_player(ee.player)
+            except socket.error as se:
+                log.error(f"Socket error: {se}")
+                self.remove_player(player)
 
         threading.Thread(target=self.cleanup).start()
 
@@ -306,7 +327,6 @@ def handle_enter(player: Player, room_id_str: str) -> None:
             if room.abort.is_set():
                 break
 
-        player.leave()
         return
 
     except Player.ExitedException as e:
